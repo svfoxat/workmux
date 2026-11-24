@@ -3,18 +3,23 @@
 //! Limitations:
 //! - No percentage-based pane size control (can resize with +/- but not set exact %)
 //! - No window insertion order (tabs always append)
+//! - Session mode switches the client into the new session immediately; there is no
+//!   background creation because a detached session never spawns panes for new tabs
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::cmd::Cmd;
 use crate::config::SplitDirection;
 
-use super::types::{CreateWindowParams, LivePaneInfo};
+use super::types::{
+    CreateSessionParams, CreateWindowInSessionParams, CreateWindowParams, LivePaneInfo,
+};
 use super::{Multiplexer, util};
 
 // Zero-width markers let workmux replace or remove only the status suffix it
@@ -25,6 +30,9 @@ const STATUS_MARKER_CLOSE: char = '\u{2064}';
 /// Zellij multiplexer backend.
 pub struct ZellijBackend {
     session_name: Option<String>,
+    /// Session the client was moved into by `create_session`. Pane IDs are only
+    /// unique per session, so every command after that targets this session.
+    switched_session: OnceLock<String>,
 }
 
 /// Info about a pane from `zellij action list-panes --json --all`
@@ -417,25 +425,35 @@ impl ZellijBackend {
     pub fn new() -> Self {
         Self {
             session_name: std::env::var("ZELLIJ_SESSION_NAME").ok(),
+            switched_session: OnceLock::new(),
         }
     }
 
     pub fn for_session(session_name: impl Into<String>) -> Self {
         Self {
             session_name: Some(session_name.into()),
+            switched_session: OnceLock::new(),
         }
+    }
+
+    /// Session that commands target: the one created by `create_session`, else the bound one.
+    fn target_session(&self) -> Option<&str> {
+        self.switched_session
+            .get()
+            .map(String::as_str)
+            .or(self.session_name.as_deref())
     }
 
     fn command(&self) -> Cmd<'_> {
         let command = Cmd::new("zellij");
-        match self.session_name.as_deref() {
+        match self.target_session() {
             Some(session_name) => command.args(&["--session", session_name]),
             None => command,
         }
     }
 
     fn shell_command(&self) -> String {
-        match self.session_name.as_deref() {
+        match self.target_session() {
             Some(session_name) => format!(
                 "zellij --session {}",
                 super::agent::shell_quote(session_name)
@@ -446,13 +464,13 @@ impl ZellijBackend {
 
     /// Check if this backend identifies a zellij session
     fn is_inside_session(&self) -> bool {
-        self.session_name.is_some() || std::env::var("ZELLIJ").is_ok()
+        self.target_session().is_some() || std::env::var("ZELLIJ").is_ok()
     }
 
     /// Get session name from the bound backend or environment
     fn session_name(&self) -> Option<String> {
-        self.session_name
-            .clone()
+        self.target_session()
+            .map(String::from)
             .or_else(|| std::env::var("ZELLIJ_SESSION_NAME").ok())
     }
 
@@ -490,6 +508,87 @@ impl ZellijBackend {
             "Failed to parse list-panes JSON output",
             Duration::from_millis(50),
         )
+    }
+
+    /// Shell command that kills and deletes a session. When `destination` is given,
+    /// the client is moved there first so it is not dropped to the shell.
+    /// The kill/delete calls name the session explicitly, so they carry no `--session`.
+    fn shell_kill_session_cmd_to(&self, full_name: &str, destination: Option<&str>) -> String {
+        let name = super::agent::shell_quote(full_name);
+        // Killing the session the client is in would drop it to the shell, so
+        // move it first: to the requested session, else any other live one.
+        let fallback = if destination.is_none()
+            && std::env::var("ZELLIJ_SESSION_NAME").is_ok_and(|current| current == full_name)
+        {
+            Self::other_live_session(full_name)
+        } else {
+            None
+        };
+        let switch = destination
+            .or(fallback.as_deref())
+            .map(|dest| {
+                // switch-session returns before the client has left, so wait for
+                // the old session to lose its clients (header line only) before
+                // killing it, or the client is dropped to the shell with it.
+                format!(
+                    "zellij action switch-session {dest} >/dev/null 2>&1; \\
+                     for _ in $(seq 50); do \\
+                     [ \"$(zellij --session {name} action list-clients 2>/dev/null | wc -l)\" -le 1 ] && break; \\
+                     sleep 0.1; done; ",
+                    dest = super::agent::shell_quote(dest),
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "{switch}zellij kill-session {name} >/dev/null 2>&1; \
+             zellij delete-session {name} --force >/dev/null 2>&1"
+        )
+    }
+
+    /// Some live session other than `excluding` (exited, resurrectable ones are skipped).
+    fn other_live_session(excluding: &str) -> Option<String> {
+        let output = Cmd::new("zellij")
+            .args(&["list-sessions", "--no-formatting"])
+            .run_and_capture_stdout()
+            .ok()?;
+        output
+            .lines()
+            .filter(|line| !line.contains("EXITED"))
+            .filter_map(|line| line.split_whitespace().next())
+            .find(|name| *name != excluding)
+            .map(String::from)
+    }
+
+    /// Names of all live sessions (`zellij list-sessions --short --no-formatting`).
+    fn list_session_names() -> Result<HashSet<String>> {
+        // Exits non-zero when no session exists, which is not an error here.
+        let output = Cmd::new("zellij")
+            .args(&["list-sessions", "--short", "--no-formatting"])
+            .run_and_capture_stdout()
+            .unwrap_or_default();
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect())
+    }
+
+    /// Poll until a terminal pane exists in `tab_id` (any tab when `None`).
+    /// New tabs and sessions spawn their panes asynchronously.
+    fn wait_for_terminal_pane(&self, tab_id: Option<u32>) -> Result<u32> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(panes) = self.list_panes()
+                && let Some(pane) = panes.iter().find(|p| is_terminal_pane_in_tab(p, tab_id))
+            {
+                return Ok(pane.id);
+            }
+            if Instant::now() >= deadline {
+                bail!("Timed out waiting for a terminal pane in the new zellij tab or session");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// Query all tabs using `zellij action list-tabs --json`
@@ -914,30 +1013,138 @@ impl Multiplexer for ZellijBackend {
             .ok_or_else(|| anyhow!("Zellij session name is required to resolve the instance"))
     }
 
-    // === Session Management (not supported in Zellij) ===
+    // === Session Management ===
 
-    fn create_session(&self, _params: super::types::CreateSessionParams) -> Result<String> {
-        Err(anyhow!(
-            "Session mode (--session) is not supported in Zellij. Use window mode instead."
-        ))
+    /// Create a session and switch the client into it.
+    ///
+    /// A detached session (`attach --create-background`) never spawns panes for
+    /// tabs added to it, so the session is created through `switch-session`, which
+    /// needs an attached client. The backend then targets the new session, since
+    /// pane IDs from here on belong to it.
+    fn create_session(&self, params: CreateSessionParams) -> Result<String> {
+        let full_name = util::prefixed(params.prefix, params.name);
+        let cwd_str = params
+            .cwd
+            .to_str()
+            .ok_or_else(|| anyhow!("Path contains non-UTF8 characters"))?;
+
+        // No `--session`: the client to move is resolved from the pane environment,
+        // the same way `zellij action switch-session` works from a shell.
+        Cmd::new("zellij")
+            .args(&["action", "switch-session", &full_name, "--cwd", cwd_str])
+            .run()
+            .with_context(|| format!("Failed to create zellij session '{}'", full_name))?;
+
+        self.switched_session
+            .set(full_name.clone())
+            .map_err(|_| anyhow!("A zellij session was already created by this process"))?;
+
+        let pane_id = self.wait_for_terminal_pane(None)?;
+        if let Some(name) = params.initial_window_name
+            && let Some((tab_id, _)) = self.tab_for_pane(&format!("terminal_{pane_id}"))?
+        {
+            self.rename_tab_by_id(tab_id, name)?;
+        }
+        Ok(format!("terminal_{pane_id}"))
     }
 
-    fn switch_to_session(&self, _prefix: &str, _name: &str) -> Result<()> {
-        Err(anyhow!(
-            "Session mode is not supported in Zellij. Use window mode instead."
-        ))
+    fn create_window_in_session(&self, params: CreateWindowInSessionParams) -> Result<String> {
+        let cwd_str = params
+            .cwd
+            .to_str()
+            .ok_or_else(|| anyhow!("Path contains non-UTF8 characters"))?;
+        let backend = Self::for_session(params.session_name);
+
+        let mut args = vec!["action", "new-tab", "--cwd", cwd_str];
+        if let Some(name) = params.name {
+            args.extend(["--name", name]);
+        }
+        let tab_id_str = backend
+            .command()
+            .args(&args)
+            .run_and_capture_stdout()
+            .with_context(|| {
+                format!("Failed to create tab in session '{}'", params.session_name)
+            })?;
+        let tab_id: u32 = tab_id_str
+            .trim()
+            .parse()
+            .with_context(|| format!("Invalid tab ID from new-tab: '{}'", tab_id_str.trim()))?;
+
+        let pane_id = backend.wait_for_terminal_pane(Some(tab_id))?;
+        Ok(format!("terminal_{pane_id}"))
     }
 
-    fn schedule_session_close(&self, _full_name: &str, _delay: Duration) -> Result<()> {
-        Err(anyhow!(
-            "Session mode is not supported in Zellij. Use window mode instead."
-        ))
+    fn switch_to_session(&self, prefix: &str, name: &str) -> Result<()> {
+        let full_name = util::prefixed(prefix, name);
+        Cmd::new("zellij")
+            .args(&["action", "switch-session", &full_name])
+            .run()
+            .with_context(|| format!("Failed to switch to zellij session '{}'", full_name))?;
+        Ok(())
     }
 
-    fn wait_until_session_closed(&self, _full_session_name: &str) -> Result<()> {
-        Err(anyhow!(
-            "Session mode is not supported in Zellij. Use window mode instead."
-        ))
+    fn session_exists(&self, full_name: &str) -> Result<bool> {
+        Ok(Self::list_session_names()?.contains(full_name))
+    }
+
+    fn get_all_session_names(&self) -> Result<HashSet<String>> {
+        Self::list_session_names()
+    }
+
+    fn kill_session(&self, full_name: &str) -> Result<()> {
+        self.kill_session_to(full_name, None)
+    }
+
+    fn kill_session_to(&self, full_name: &str, destination: Option<&str>) -> Result<()> {
+        let script = self.shell_kill_session_cmd_to(full_name, destination);
+        // `delete-session` fails once `kill-session` already removed the session,
+        // so check the outcome instead of the exit status.
+        let _ = Cmd::new("sh").args(&["-c", &script]).run();
+        if self.session_exists(full_name)? {
+            bail!("Zellij session '{full_name}' is still running after kill");
+        }
+        Ok(())
+    }
+
+    fn rename_session(&self, old_full_name: &str, new_full_name: &str) -> Result<()> {
+        Self::for_session(old_full_name)
+            .command()
+            .args(&["action", "rename-session", new_full_name])
+            .run()
+            .with_context(|| format!("Failed to rename zellij session '{}'", old_full_name))?;
+        Ok(())
+    }
+
+    fn supports_session_mode(&self) -> bool {
+        true
+    }
+
+    fn session_close_handles_navigation(&self) -> bool {
+        true
+    }
+
+    fn schedule_session_close(&self, full_name: &str, delay: Duration) -> Result<()> {
+        self.schedule_session_close_to(full_name, None, delay)
+    }
+
+    fn schedule_session_close_to(
+        &self,
+        full_name: &str,
+        destination: Option<&str>,
+        delay: Duration,
+    ) -> Result<()> {
+        let kill = self.shell_kill_session_cmd_to(full_name, destination);
+        let script = format!("sleep {:.3}; {kill}", delay.as_secs_f64());
+        util::run_detached_sh_c(&script)
+    }
+
+    fn wait_until_session_closed(&self, full_session_name: &str) -> Result<()> {
+        println!("Waiting for session '{}' to close...", full_session_name);
+        while self.session_exists(full_session_name)? {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        Ok(())
     }
 
     fn run_deferred_script(&self, script: &str) -> Result<()> {
@@ -962,16 +1169,15 @@ impl Multiplexer for ZellijBackend {
         ))
     }
 
-    fn shell_switch_session_cmd(&self, _full_name: &str) -> Result<String> {
-        Err(anyhow!(
-            "Session mode is not supported in Zellij. Use window mode instead."
+    fn shell_switch_session_cmd(&self, full_name: &str) -> Result<String> {
+        Ok(format!(
+            "zellij action switch-session {} >/dev/null 2>&1",
+            super::agent::shell_quote(full_name)
         ))
     }
 
-    fn shell_kill_session_cmd(&self, _full_name: &str) -> Result<String> {
-        Err(anyhow!(
-            "Session mode is not supported in Zellij. Use window mode instead."
-        ))
+    fn shell_kill_session_cmd(&self, full_name: &str) -> Result<String> {
+        Ok(self.shell_kill_session_cmd_to(full_name, None))
     }
 
     // === Window/Tab Management ===
@@ -1614,6 +1820,52 @@ mod tests {
         assert_eq!(backend.instance_id(), "dev session");
         assert_eq!(backend.shell_command(), "zellij --session 'dev session'");
         assert!(backend.is_inside_session());
+    }
+
+    #[test]
+    fn created_session_becomes_the_command_target() {
+        let backend = ZellijBackend::for_session("dev");
+        backend
+            .switched_session
+            .set("wm-feature".to_string())
+            .unwrap();
+        assert_eq!(backend.instance_id(), "wm-feature");
+        assert_eq!(backend.shell_command(), "zellij --session wm-feature");
+    }
+
+    #[test]
+    fn shell_switch_session_cmd_quotes_the_name() {
+        let backend = ZellijBackend::for_session("dev");
+        let cmd = backend.shell_switch_session_cmd("wm-my feature").unwrap();
+        assert_eq!(
+            cmd,
+            "zellij action switch-session 'wm-my feature' >/dev/null 2>&1"
+        );
+    }
+
+    #[test]
+    fn shell_kill_session_cmd_moves_client_to_destination_first() {
+        let backend = ZellijBackend::for_session("wm-feature");
+        let cmd = backend.shell_kill_session_cmd_to("wm-feature", Some("main"));
+        assert!(
+            cmd.starts_with("zellij action switch-session main "),
+            "{cmd}"
+        );
+        assert!(cmd.contains("zellij kill-session wm-feature"), "{cmd}");
+        assert!(
+            cmd.contains("zellij delete-session wm-feature --force"),
+            "{cmd}"
+        );
+
+        assert!(cmd.contains("list-clients"), "{cmd}");
+        let syntax = std::process::Command::new("sh")
+            .args(["-n", "-c", &cmd])
+            .status()
+            .unwrap();
+        assert!(syntax.success(), "{cmd}");
+
+        let no_dest = backend.shell_kill_session_cmd_to("wm-feature", None);
+        assert!(no_dest.starts_with("zellij kill-session"), "{no_dest}");
     }
 
     #[test]

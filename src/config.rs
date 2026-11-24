@@ -3001,6 +3001,19 @@ impl Config {
             config.window_prefix = Some(expand_project_placeholder(prefix, &project_name));
         }
 
+        // Zellij sessions are shared across repositories, so name them
+        // `<project>:<worktree>` unless a prefix is configured explicitly.
+        if config.window_prefix.is_none()
+            && config.mode() == MuxMode::Session
+            && crate::multiplexer::detect_backend() == crate::multiplexer::BackendType::Zellij
+            && let Ok(project_name) = git::config_project_name_in(Some(start_dir))
+        {
+            config.window_prefix = Some(expand_project_placeholder(
+                &format!("{PROJECT_PLACEHOLDER}:"),
+                &project_name,
+            ));
+        }
+
         debug!(
             agent = ?config.agent,
             has_location = location.is_some(),
